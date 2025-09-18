@@ -61,8 +61,11 @@ func main() {
 			return err
 		}
 
+		// Get folder name and include it in the path
+		folderName := filepath.Base(localFolder)
+		
 		// Convert path separators to forward slashes for S3
-		s3Key := filepath.ToSlash(relPath)
+		s3Key := filepath.ToSlash(filepath.Join(folderName, relPath))
 
 		// Convert NFD to NFC
 		s3Key = norm.NFC.String(s3Key)
