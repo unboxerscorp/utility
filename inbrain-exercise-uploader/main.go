@@ -15,13 +15,6 @@ import (
 	"github.com/go-jet/jet/v2/postgres"
 	"github.com/go-jet/jet/v2/qrm"
 	"github.com/google/uuid"
-
-	"github.com/unboxerscorp/base-server/.gen/model"
-	"github.com/unboxerscorp/base-server/.gen/table"
-	"github.com/unboxerscorp/base-server/db"
-	"github.com/unboxerscorp/base-server/internal/types"
-	"github.com/unboxerscorp/base-server/internal/utils/file"
-	"github.com/unboxerscorp/base-server/internal/utils/pointer"
 )
 
 func processExercises(ctx context.Context, database *sql.DB, jsonProblems []map[string]any, basename string, isG bool) error {
