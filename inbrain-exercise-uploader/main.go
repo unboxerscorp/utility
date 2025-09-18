@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
@@ -31,11 +31,11 @@ func processExercises(ctx context.Context, database *sql.DB, jsonProblems []map[
 		}
 		err = processExercise(ctx, tx, v, basename, isG)
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			fmt.Printf("Warning: failed to process exercise: %v\n", err)
 			// 개별 문제 처리 실패는 경고만 하고 다음 문제 계속 처리
 		} else {
-			tx.Commit()
+			_ = tx.Commit()
 		}
 	}
 	return nil
@@ -59,12 +59,14 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 	conceptID := int(conceptIDFloat)
 
 	// SQL Injection 방지
-	query := `SELECT id FROM categories WHERE metadata->>'mathflatConceptId' = $1 AND deleted_at IS NULL`
+	query := `SELECT id FROM categories WHERE "metadata"->>'mathflatConceptId' = $1 AND deleted_at IS NULL`
 	rows, err := tx.QueryContext(ctx, query, strconv.Itoa(conceptID))
 	if err != nil {
 		return fmt.Errorf("failed to query categories: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	var categories []struct{ ID int64 }
 	for rows.Next() {
@@ -94,7 +96,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 	if hasGroupCode {
 		groupCode := int(groupCodeFloat)
 		query := `SELECT id, representative_id FROM exercise_groups
-				  WHERE metadata->>'mathflatConceptId' = $1 AND metadata->>'mathflatGroupCode' = $2 AND deleted_at IS NULL`
+				  WHERE "metadata"->>'mathflatConceptId' = $1 AND "metadata"->>'mathflatGroupCode' = $2 AND deleted_at IS NULL`
 		err = tx.QueryRowContext(ctx, query, strconv.Itoa(conceptID), strconv.Itoa(groupCode)).Scan(
 			&exerciseGroup.ID, &exerciseGroup.RepresentativeID)
 
@@ -106,7 +108,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 					"mathflatGroupCode": groupCode,
 				}
 				metadataBytes, _ := json.Marshal(metadataData)
-				insertQuery := `INSERT INTO exercise_groups (metadata, category_id, created_at, updated_at)
+				insertQuery := `INSERT INTO exercise_groups ("metadata", category_id, created_at, updated_at)
 						   VALUES ($1, $2, NOW(), NOW())
 						   RETURNING id, representative_id`
 				err = tx.QueryRowContext(ctx, insertQuery, metadataBytes, categories[0].ID).Scan(
@@ -124,7 +126,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 			"mathflatConceptId": conceptID,
 		}
 		metadataBytes, _ := json.Marshal(metadataData)
-		insertQuery := `INSERT INTO exercise_groups (metadata, category_id, created_at, updated_at)
+		insertQuery := `INSERT INTO exercise_groups ("metadata", category_id, created_at, updated_at)
 				   VALUES ($1, $2, NOW(), NOW())
 				   RETURNING id, representative_id`
 		err = tx.QueryRowContext(ctx, insertQuery, metadataBytes, categories[0].ID).Scan(
@@ -146,8 +148,8 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 		ID         int64
 		References []byte
 	}
-	query = `SELECT id, references FROM exercises
-			 WHERE metadata->>'mathflatProblemId' = $1 AND deleted_at IS NULL`
+	query = `SELECT id, "references" FROM exercises
+			 WHERE "metadata"->>'mathflatProblemId' = $1 AND deleted_at IS NULL`
 	err = tx.QueryRowContext(ctx, query, strconv.Itoa(problemIDInt)).Scan(
 		&existingExercise.ID, &existingExercise.References)
 
@@ -167,9 +169,10 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 		gRefs := []string{"[기출]"}
 		for i, sp := range sp {
 			spstr := sp
-			if i == 1 {
+			switch i {
+			case 1:
 				spstr += "년"
-			} else if i == 2 {
+			case 2:
 				spstr += "월"
 			}
 			gRefs = append(gRefs, spstr)
@@ -214,7 +217,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 		if len(mergedRefs) > len(existingRefs) {
 			referencesData, _ := json.Marshal(mergedRefs)
 
-			updateQuery := `UPDATE exercises SET references = $1, updated_at = NOW() WHERE id = $2`
+			updateQuery := `UPDATE exercises SET "references" = $1, updated_at = NOW() WHERE id = $2`
 			_, err = tx.ExecContext(ctx, updateQuery, referencesData, existingExercise.ID)
 
 			if err != nil {
@@ -279,6 +282,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 
 	var objectiveAnswer *int64
 	var subjectiveAnswer *string
+	var answerType string
 
 	switch typeStr {
 	case "SINGLE_CHOICE":
@@ -293,18 +297,20 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 		}
 		a := int64(answer)
 		objectiveAnswer = &a
+		answerType = "objective"
 	case "SHORT_ANSWER":
 		answerStr, _ := v["answer"].(string)
 		subjectiveAnswer = &answerStr
+		answerType = "subjective"
 	default:
 		return errors.New("unknown type")
 	}
 
 	// Exercise INSERT
 	insertQuery := `INSERT INTO exercises (
-		uuid, title, level, rate, metadata, question_images, answer_image,
+		"uuid", "title", "level", "rate", "metadata", question_images, answer_image,
 		solution_images, is_trendy, category_id, objective_answer,
-		subjective_answer, exercise_group_id, references, answer_type, created_at, updated_at
+		subjective_answer, exercise_group_id, "references", answer_type, created_at, updated_at
 	) VALUES (
 		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW()
 	) RETURNING id`
@@ -314,7 +320,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 		exerciseUUID.String(), conceptName, levelPtr, ratePtr, metadataBytes,
 		questionImagesData, answerImagePtr, solutionImagesData, isTrendyPtr,
 		categoryIDPtr, objectiveAnswer, subjectiveAnswer, exerciseGroup.ID,
-		referencesData, typeStr,
+		referencesData, answerType,
 	).Scan(&exerciseID)
 	if err != nil {
 		return err
@@ -336,7 +342,7 @@ func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename
 // 카테고리 구조 생성 함수 (기존 setUnit의 로직)
 // sequence 파일 관리 함수들
 func getSequenceFilePath(category string) string {
-	return filepath.Join("cmd", "seed", "sequences", category+".txt")
+	return filepath.Join("sequences", category+".txt")
 }
 
 func loadSequenceMap(category string) (map[string]int, error) {
@@ -351,7 +357,9 @@ func loadSequenceMap(category string) (map[string]int, error) {
 		}
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	scanner := bufio.NewScanner(file)
 	sequence := 0
@@ -380,7 +388,9 @@ func saveSequenceMap(category string, sequenceMap map[string]int) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	writer := bufio.NewWriter(file)
 	for _, item := range items {
@@ -463,7 +473,8 @@ func createCategoryStructure(ctx context.Context, tx *sql.Tx, conceptInfo map[st
 
 	// subjectName 처리 및 세부과목 카테고리 생성
 	var detailCategory *struct{ ID int64 }
-	if c2 == "고등학교" {
+	switch c2 {
+	case "고등학교":
 		// 고등학교는 subjectName 사용
 		if subjectName, ok := conceptInfo["subjectName"].(string); ok && subjectName != "" {
 			c4 := subjectName
@@ -485,7 +496,8 @@ func createCategoryStructure(ctx context.Context, tx *sql.Tx, conceptInfo map[st
 		} else {
 			return errors.New("subjectName not found or empty for high school")
 		}
-	} else if c2 == "중학교" {
+
+	case "중학교":
 		// 중학교는 gradeName + semesterName 조합
 		gradeName, _ := conceptInfo["gradeName"].(string)
 		semesterName, _ := conceptInfo["semesterName"].(string)
@@ -604,7 +616,9 @@ func processFile(database *sql.DB, filename string, isG bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
-	defer jsonFile.Close()
+	defer func() {
+		_ = jsonFile.Close()
+	}()
 
 	data, err := io.ReadAll(jsonFile)
 	if err != nil {
@@ -638,9 +652,9 @@ func processFile(database *sql.DB, filename string, isG bool) error {
 					}
 					err = createCategoryStructure(ctx, tx, concept)
 					if err != nil {
-						tx.Rollback()
+						_ = tx.Rollback()
 					} else {
-						tx.Commit()
+						_ = tx.Commit()
 					}
 					if err != nil {
 						fmt.Printf("Warning: failed to create category structure for conceptId %v: %v\n", conceptId, err)
@@ -701,20 +715,21 @@ func main() {
 
 	// AWS Secrets Manager에서 DB 패스워드 가져오기
 	fmt.Println("Retrieving DB password from AWS Secrets Manager...")
-	dbPassword, err := getDBPasswordFromSecretsManager()
+	ctx := context.Background()
+	dbPassword, err := getDBPasswordFromSecretsManager(ctx)
 	if err != nil {
 		fmt.Printf("Error retrieving DB password: %v\n", err)
 		os.Exit(1)
 	}
 
-	// PostgreSQL 데이터베이스 연결 문자열 생성
-	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		dbUser, dbPassword, *dbHost, *dbPort, *dbName, *sslMode)
+	// PostgreSQL 데이터베이스 연결 문자열 생성 (DSN 형식)
+	dbDSN := fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s",
+		*dbHost, *dbPort, *dbName, dbUser, dbPassword, *sslMode)
 
-	fmt.Printf("Connecting to database: postgres://%s:***@%s:%s/%s?sslmode=%s\n",
-		dbUser, *dbHost, *dbPort, *dbName, *sslMode)
+	fmt.Printf("Connecting to database: host=%s port=%s dbname=%s user=%s sslmode=%s\n",
+		*dbHost, *dbPort, *dbName, dbUser, *sslMode)
 
-	database, err := sql.Open("postgres", dbURL)
+	database, err := sql.Open("postgres", dbDSN)
 	if err != nil {
 		fmt.Printf("Error connecting to database: %v\n", err)
 		os.Exit(1)
@@ -734,10 +749,10 @@ func getOrCreateCategory(ctx context.Context, tx *sql.Tx, parentID *int64, title
 	var err error
 
 	if parentID == nil {
-		query := `SELECT id FROM categories WHERE parent_id IS NULL AND title = $1 AND deleted_at IS NULL LIMIT 1`
+		query := `SELECT id FROM categories WHERE parent_id IS NULL AND "title" = $1 AND deleted_at IS NULL LIMIT 1`
 		err = tx.QueryRowContext(ctx, query, title).Scan(&category.ID)
 	} else {
-		query := `SELECT id FROM categories WHERE parent_id = $1 AND title = $2 AND deleted_at IS NULL LIMIT 1`
+		query := `SELECT id FROM categories WHERE parent_id = $1 AND "title" = $2 AND deleted_at IS NULL LIMIT 1`
 		err = tx.QueryRowContext(ctx, query, *parentID, title).Scan(&category.ID)
 	}
 
@@ -749,7 +764,7 @@ func getOrCreateCategory(ctx context.Context, tx *sql.Tx, parentID *int64, title
 			}
 			metadataBytes, _ := json.Marshal(metadata)
 
-			insertQuery := `INSERT INTO categories (title, parent_id, sequence, metadata, created_at, updated_at)
+			insertQuery := `INSERT INTO categories ("title", parent_id, "sequence", "metadata", created_at, updated_at)
 						   VALUES ($1, $2, $3, $4, NOW(), NOW())
 						   RETURNING id`
 			err = tx.QueryRowContext(ctx, insertQuery, title, parentID, sequence, metadataBytes).Scan(&category.ID)
@@ -765,21 +780,19 @@ func getOrCreateCategory(ctx context.Context, tx *sql.Tx, parentID *int64, title
 }
 
 // AWS Secrets Manager에서 DB 패스워드 가져오기
-func getDBPasswordFromSecretsManager() (string, error) {
-	// AWS 세션 생성 (서울 리전)
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String("ap-northeast-2"),
-	})
+func getDBPasswordFromSecretsManager(ctx context.Context) (string, error) {
+	// AWS 설정 로드 (서울 리전)
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("ap-northeast-2"))
 	if err != nil {
-		return "", fmt.Errorf("failed to create AWS session: %w", err)
+		return "", fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
 	// Secrets Manager 클라이언트 생성
-	svc := secretsmanager.New(sess)
+	svc := secretsmanager.NewFromConfig(cfg)
 
 	// 시크릿 값 가져오기
 	secretName := "base-inbrain/production/DB_PASSWORD"
-	result, err := svc.GetSecretValue(&secretsmanager.GetSecretValueInput{
+	result, err := svc.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretName),
 	})
 	if err != nil {
