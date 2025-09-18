@@ -6,33 +6,42 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/go-jet/jet/v2/postgres"
-	"github.com/go-jet/jet/v2/qrm"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 )
 
 func processExercises(ctx context.Context, database *sql.DB, jsonProblems []map[string]any, basename string, isG bool) error {
 	for _, v := range jsonProblems {
 		// 각 문제를 개별 트랜잭션으로 처리
-		err := db.ExecWithTx(ctx, database, func(ctx context.Context, tx *sql.Tx) error {
-			return processExercise(ctx, database, v, basename, isG)
-		})
+		tx, err := database.BeginTx(ctx, nil)
 		if err != nil {
+			fmt.Printf("Warning: failed to begin transaction: %v\n", err)
+			continue
+		}
+		err = processExercise(ctx, tx, v, basename, isG)
+		if err != nil {
+			tx.Rollback()
 			fmt.Printf("Warning: failed to process exercise: %v\n", err)
 			// 개별 문제 처리 실패는 경고만 하고 다음 문제 계속 처리
+		} else {
+			tx.Commit()
 		}
 	}
 	return nil
 }
 
-func processExercise(ctx context.Context, database *sql.DB, v map[string]any, basename string, isG bool) error {
-	executor := db.GetExecutor(ctx, database)
+func processExercise(ctx context.Context, tx *sql.Tx, v map[string]any, basename string, isG bool) error {
 
 	// 타입 안전성 개선
 	typeStr, ok := v["type"].(string)
@@ -49,15 +58,24 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 	}
 	conceptID := int(conceptIDFloat)
 
-	var categories []model.Categories
-	// SQL Injection 방지 - CAST 사용
-	err := postgres.SELECT(
-		table.Categories.AllColumns,
-	).FROM(
-		table.Categories,
-	).WHERE(
-		postgres.RawBool("metadata->'mathflatConceptId' = conceptID", postgres.RawArgs{"conceptID": conceptID}),
-	).Query(executor, &categories)
+	// SQL Injection 방지
+	query := `SELECT id FROM categories WHERE metadata->>'mathflatConceptId' = $1 AND deleted_at IS NULL`
+	rows, err := tx.QueryContext(ctx, query, strconv.Itoa(conceptID))
+	if err != nil {
+		return fmt.Errorf("failed to query categories: %w", err)
+	}
+	defer rows.Close()
+
+	var categories []struct{ ID int64 }
+	for rows.Next() {
+		var cat struct{ ID int64 }
+		err := rows.Scan(&cat.ID)
+		if err != nil {
+			return fmt.Errorf("failed to scan category: %w", err)
+		}
+		categories = append(categories, cat)
+	}
+	err = rows.Err()
 
 	if err != nil {
 		return fmt.Errorf("failed to find category: %w", err)
@@ -68,36 +86,31 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 
 	// Exercise Group 처리
 	groupCodeFloat, hasGroupCode := v["groupCode"].(float64)
-	var exerciseGroup model.ExerciseGroups
+	var exerciseGroup struct {
+		ID               int64
+		RepresentativeID *int64
+	}
 
 	if hasGroupCode {
 		groupCode := int(groupCodeFloat)
-		err = postgres.SELECT(
-			table.ExerciseGroups.AllColumns,
-		).FROM(
-			table.ExerciseGroups,
-		).WHERE(
-			postgres.RawBool("metadata->'mathflatConceptId' = conceptID", postgres.RawArgs{"conceptID": conceptID}).AND(
-				postgres.RawBool("metadata->'mathflatGroupCode' = groupCode", postgres.RawArgs{"groupCode": groupCode}),
-			),
-		).Query(executor, &exerciseGroup)
+		query := `SELECT id, representative_id FROM exercise_groups
+				  WHERE metadata->>'mathflatConceptId' = $1 AND metadata->>'mathflatGroupCode' = $2 AND deleted_at IS NULL`
+		err = tx.QueryRowContext(ctx, query, strconv.Itoa(conceptID), strconv.Itoa(groupCode)).Scan(
+			&exerciseGroup.ID, &exerciseGroup.RepresentativeID)
 
 		if err != nil {
-			if errors.Is(err, qrm.ErrNoRows) {
+			if err == sql.ErrNoRows {
 				// 메타데이터 타입 일관성 - 모두 int로 통일
 				metadataData := map[string]any{
 					"mathflatConceptId": conceptID,
 					"mathflatGroupCode": groupCode,
 				}
 				metadataBytes, _ := json.Marshal(metadataData)
-				metadata := types.JSONB(metadataBytes)
-				err = table.ExerciseGroups.INSERT(
-					table.ExerciseGroups.Metadata,
-					table.ExerciseGroups.CategoryID,
-				).VALUES(
-					metadata,
-					categories[0].ID,
-				).RETURNING(table.ExerciseGroups.AllColumns).Query(executor, &exerciseGroup)
+				insertQuery := `INSERT INTO exercise_groups (metadata, category_id, created_at, updated_at)
+						   VALUES ($1, $2, NOW(), NOW())
+						   RETURNING id, representative_id`
+				err = tx.QueryRowContext(ctx, insertQuery, metadataBytes, categories[0].ID).Scan(
+					&exerciseGroup.ID, &exerciseGroup.RepresentativeID)
 				if err != nil {
 					return err
 				}
@@ -111,14 +124,11 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 			"mathflatConceptId": conceptID,
 		}
 		metadataBytes, _ := json.Marshal(metadataData)
-		metadata := types.JSONB(metadataBytes)
-		err = table.ExerciseGroups.INSERT(
-			table.ExerciseGroups.Metadata,
-			table.ExerciseGroups.CategoryID,
-		).VALUES(
-			metadata,
-			categories[0].ID,
-		).RETURNING(table.ExerciseGroups.AllColumns).Query(executor, &exerciseGroup)
+		insertQuery := `INSERT INTO exercise_groups (metadata, category_id, created_at, updated_at)
+				   VALUES ($1, $2, NOW(), NOW())
+				   RETURNING id, representative_id`
+		err = tx.QueryRowContext(ctx, insertQuery, metadataBytes, categories[0].ID).Scan(
+			&exerciseGroup.ID, &exerciseGroup.RepresentativeID)
 		if err != nil {
 			return err
 		}
@@ -132,14 +142,14 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 	problemIDInt := int(problemID)
 
 	// 기존 Exercise 확인
-	var existingExercise model.Exercises
-	err = postgres.SELECT(
-		table.Exercises.AllColumns,
-	).FROM(
-		table.Exercises,
-	).WHERE(
-		postgres.RawBool("metadata->'mathflatProblemId' = problemID", postgres.RawArgs{"problemID": problemIDInt}).AND(table.Exercises.DeletedAt.IS_NULL()),
-	).Query(executor, &existingExercise)
+	var existingExercise struct {
+		ID         int64
+		References []byte
+	}
+	query = `SELECT id, references FROM exercises
+			 WHERE metadata->>'mathflatProblemId' = $1 AND deleted_at IS NULL`
+	err = tx.QueryRowContext(ctx, query, strconv.Itoa(problemIDInt)).Scan(
+		&existingExercise.ID, &existingExercise.References)
 
 	// tagTop 처리 - references 필드로 변환
 	var references []string
@@ -203,15 +213,9 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 		// references가 변경된 경우만 업데이트
 		if len(mergedRefs) > len(existingRefs) {
 			referencesData, _ := json.Marshal(mergedRefs)
-			referencesJSON := types.JSONB(referencesData)
 
-			_, err = table.Exercises.UPDATE(
-				table.Exercises.References,
-			).SET(
-				&referencesJSON,
-			).WHERE(
-				table.Exercises.ID.EQ(postgres.Int64(existingExercise.ID)),
-			).Exec(executor)
+			updateQuery := `UPDATE exercises SET references = $1, updated_at = NOW() WHERE id = $2`
+			_, err = tx.ExecContext(ctx, updateQuery, referencesData, existingExercise.ID)
 
 			if err != nil {
 				return fmt.Errorf("failed to update exercise references: %w", err)
@@ -222,26 +226,23 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 		}
 		return nil // 이미 존재하는 문제 처리 완료
 	}
-	if !errors.Is(err, qrm.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing exercise: %w", err)
 	}
 
 	// Exercise 데이터 준비
-	uuid := uuid.New()
+	exerciseUUID := uuid.New()
 
 	metadataData := map[string]any{
 		"mathflatProblemId": problemIDInt,
 	}
 	metadataBytes, _ := json.Marshal(metadataData)
-	metadata := types.JSONB(metadataBytes)
 
 	problemImageURL, _ := v["problemImageUrl"].(string)
 	questionImagesData, _ := json.Marshal([]string{problemImageURL})
-	questionImages := types.JSONB(questionImagesData)
 
 	solutionImageURL, _ := v["solutionImageUrl"].(string)
 	solutionImagesData, _ := json.Marshal([]string{solutionImageURL})
-	solutionImages := types.JSONB(solutionImagesData)
 
 	conceptName, _ := v["conceptName"].(string)
 	level, _ := v["level"].(float64)
@@ -250,28 +251,34 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 	isTrendy, _ := v["trendy"].(bool)
 
 	// references 준비
-	var referencesJSON types.JSONB
+	var referencesData []byte
 	if len(references) > 0 {
-		referencesData, _ := json.Marshal(references)
-		referencesJSON = types.JSONB(referencesData)
+		referencesData, _ = json.Marshal(references)
 	} else {
-		referencesJSON = types.JSONB("[]")
+		referencesData, _ = json.Marshal([]string{})
 	}
 
-	exercise := &model.Exercises{
-		UUID:            uuid.String(),
-		Title:           conceptName,
-		Level:           pointer.To(int64(level)),
-		Rate:            pointer.To(int64(rate)),
-		Metadata:        metadata,
-		QuestionImages:  questionImages,
-		AnswerImage:     pointer.To(answerImageURL),
-		SolutionImages:  solutionImages,
-		IsTrendy:        pointer.To(isTrendy),
-		CategoryID:      pointer.To(categories[0].ID),
-		ExerciseGroupID: exerciseGroup.ID,
-		References:      referencesJSON,
+	var levelPtr, ratePtr *int64
+	var answerImagePtr *string
+	var isTrendyPtr *bool
+	var categoryIDPtr *int64
+
+	if level != 0 {
+		l := int64(level)
+		levelPtr = &l
 	}
+	if rate != 0 {
+		r := int64(rate)
+		ratePtr = &r
+	}
+	if answerImageURL != "" {
+		answerImagePtr = &answerImageURL
+	}
+	isTrendyPtr = &isTrendy
+	categoryIDPtr = &categories[0].ID
+
+	var objectiveAnswer *int64
+	var subjectiveAnswer *string
 
 	switch typeStr {
 	case "SINGLE_CHOICE":
@@ -280,55 +287,47 @@ func processExercise(ctx context.Context, database *sql.DB, v map[string]any, ba
 			return errors.New("invalid answer format")
 		}
 
-		var answer int
-		answer, err = strconv.Atoi(answerStr)
+		answer, err := strconv.Atoi(answerStr)
 		if err != nil {
 			return err
 		}
-		exercise.ObjectiveAnswer = pointer.To(int64(answer))
+		a := int64(answer)
+		objectiveAnswer = &a
 	case "SHORT_ANSWER":
 		answerStr, _ := v["answer"].(string)
-		exercise.SubjectiveAnswer = pointer.To(answerStr)
+		subjectiveAnswer = &answerStr
 	default:
 		return errors.New("unknown type")
 	}
 
-	err = table.Exercises.INSERT(
-		table.Exercises.UUID,
-		table.Exercises.Title,
-		table.Exercises.Level,
-		table.Exercises.Rate,
-		table.Exercises.Metadata,
-		table.Exercises.QuestionImages,
-		table.Exercises.AnswerImage,
-		table.Exercises.SolutionImages,
-		table.Exercises.IsTrendy,
-		table.Exercises.CategoryID,
-		table.Exercises.ObjectiveAnswer,
-		table.Exercises.SubjectiveAnswer,
-		table.Exercises.ExerciseGroupID,
-		table.Exercises.References,
-	).
-		MODEL(exercise).
-		RETURNING(table.Exercises.AllColumns).
-		Query(executor, exercise)
+	// Exercise INSERT
+	insertQuery := `INSERT INTO exercises (
+		uuid, title, level, rate, metadata, question_images, answer_image,
+		solution_images, is_trendy, category_id, objective_answer,
+		subjective_answer, exercise_group_id, references, answer_type, created_at, updated_at
+	) VALUES (
+		$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW()
+	) RETURNING id`
+
+	var exerciseID int64
+	err = tx.QueryRowContext(ctx, insertQuery,
+		exerciseUUID.String(), conceptName, levelPtr, ratePtr, metadataBytes,
+		questionImagesData, answerImagePtr, solutionImagesData, isTrendyPtr,
+		categoryIDPtr, objectiveAnswer, subjectiveAnswer, exerciseGroup.ID,
+		referencesData, typeStr,
+	).Scan(&exerciseID)
 	if err != nil {
 		return err
 	}
 
 	// ExerciseGroup에 대표 문제가 없으면 현재 문제를 대표 문제로 설정
 	if exerciseGroup.RepresentativeID == nil {
-		_, err = table.ExerciseGroups.UPDATE(
-			table.ExerciseGroups.RepresentativeID,
-		).SET(
-			exercise.ID,
-		).WHERE(
-			table.ExerciseGroups.ID.EQ(postgres.Int64(exerciseGroup.ID)),
-		).Exec(executor)
+		updateQuery := `UPDATE exercise_groups SET representative_id = $1, updated_at = NOW() WHERE id = $2`
+		_, err = tx.ExecContext(ctx, updateQuery, exerciseID, exerciseGroup.ID)
 		if err != nil {
 			return err
 		}
-		exerciseGroup.RepresentativeID = &exercise.ID
+		exerciseGroup.RepresentativeID = &exerciseID
 	}
 
 	return nil
@@ -417,7 +416,7 @@ func getOrAssignSequence(category string, name string) (int64, error) {
 	return int64(newSeq), nil
 }
 
-func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo map[string]any) error {
+func createCategoryStructure(ctx context.Context, tx *sql.Tx, conceptInfo map[string]any) error {
 	// revisionName에서 교육과정 추출
 	var c1 string
 	var s1 int64
@@ -447,23 +446,23 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 	s3 := int64(0)
 
 	// 카테고리 생성 (빈 metadata 대신 빈 map 전달)
-	curriculumCategory, err := getOrCreateCategory(executor, nil, c1, s1, map[string]any{})
+	curriculumCategory, err := getOrCreateCategory(ctx, tx, nil, c1, s1, map[string]any{})
 	if err != nil {
 		return err
 	}
 
-	schoolCategory, err := getOrCreateCategory(executor, &curriculumCategory.ID, c2, s2, map[string]any{})
+	schoolCategory, err := getOrCreateCategory(ctx, tx, &curriculumCategory.ID, c2, s2, map[string]any{})
 	if err != nil {
 		return err
 	}
 
-	subjectCategory, err := getOrCreateCategory(executor, &schoolCategory.ID, c3, s3, map[string]any{})
+	subjectCategory, err := getOrCreateCategory(ctx, tx, &schoolCategory.ID, c3, s3, map[string]any{})
 	if err != nil {
 		return err
 	}
 
 	// subjectName 처리 및 세부과목 카테고리 생성
-	var detailCategory *model.Categories
+	var detailCategory *struct{ ID int64 }
 	if c2 == "고등학교" {
 		// 고등학교는 subjectName 사용
 		if subjectName, ok := conceptInfo["subjectName"].(string); ok && subjectName != "" {
@@ -476,7 +475,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 
 			subjectId, _ := conceptInfo["subjectId"].(float64)
 
-			detailCategory, err = getOrCreateCategory(executor, &subjectCategory.ID, c4, s4, map[string]any{
+			detailCategory, err = getOrCreateCategory(ctx, tx, &subjectCategory.ID, c4, s4, map[string]any{
 				"mathflatSubjectID": int(subjectId),
 			})
 			if err != nil {
@@ -499,7 +498,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 				return fmt.Errorf("failed to get middle school subject sequence: %w", err)
 			}
 
-			detailCategory, err = getOrCreateCategory(executor, &subjectCategory.ID, c4, s4, map[string]any{})
+			detailCategory, err = getOrCreateCategory(ctx, tx, &subjectCategory.ID, c4, s4, map[string]any{})
 			if err != nil {
 				return err
 			}
@@ -519,7 +518,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 	if bigChapterId, ok := conceptInfo["bigChapterId"].(float64); ok {
 		if bigChapterName, ok := conceptInfo["bigChapterName"].(string); ok {
 
-			bigChapter, err := getOrCreateCategory(executor, &detailCategory.ID, bigChapterName, 0, map[string]any{
+			bigChapter, err := getOrCreateCategory(ctx, tx, &detailCategory.ID, bigChapterName, 0, map[string]any{
 				"mathflatBigChapterId": int(bigChapterId),
 			})
 			if err != nil {
@@ -528,7 +527,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 
 			if middleChapterId, ok := conceptInfo["middleChapterId"].(float64); ok {
 				if middleChapterName, ok := conceptInfo["middleChapterName"].(string); ok {
-					middleChapter, err := getOrCreateCategory(executor, &bigChapter.ID, middleChapterName, 0, map[string]any{
+					middleChapter, err := getOrCreateCategory(ctx, tx, &bigChapter.ID, middleChapterName, 0, map[string]any{
 						"mathflatMiddleChapterId": int(middleChapterId),
 					})
 					if err != nil {
@@ -537,7 +536,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 
 					if littleChapterId, ok := conceptInfo["littleChapterId"].(float64); ok {
 						if littleChapterName, ok := conceptInfo["littleChapterName"].(string); ok {
-							littleChapter, err := getOrCreateCategory(executor, &middleChapter.ID, littleChapterName, 0, map[string]any{
+							littleChapter, err := getOrCreateCategory(ctx, tx, &middleChapter.ID, littleChapterName, 0, map[string]any{
 								"mathflatLittleChapterId": int(littleChapterId),
 							})
 							if err != nil {
@@ -546,7 +545,7 @@ func createCategoryStructure(ctx context.Context, executor qrm.DB, conceptInfo m
 
 							if conceptId, ok := conceptInfo["conceptId"].(float64); ok {
 								if conceptName, ok := conceptInfo["conceptName"].(string); ok {
-									_, err = getOrCreateCategory(executor, &littleChapter.ID, conceptName, 0, map[string]any{
+									_, err = getOrCreateCategory(ctx, tx, &littleChapter.ID, conceptName, 0, map[string]any{
 										"mathflatConceptId": int(conceptId),
 									})
 									if err != nil {
@@ -601,7 +600,13 @@ func processFolder(database *sql.DB, folderPath string, isG bool) {
 // processFile은 단일 JSON 파일을 처리합니다
 func processFile(database *sql.DB, filename string, isG bool) error {
 	// JSON 파일 읽기
-	data, err := file.SafeReadFile(filename)
+	jsonFile, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer jsonFile.Close()
+
+	data, err := io.ReadAll(jsonFile)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
@@ -626,10 +631,17 @@ func processFile(database *sql.DB, filename string, isG bool) error {
 				if !conceptMap[conceptId] {
 					conceptMap[conceptId] = true
 					// 개별 트랜잭션으로 카테고리 구조 생성
-					err := db.ExecWithTx(ctx, database, func(ctx context.Context, tx *sql.Tx) error {
-						executor := db.GetExecutor(ctx, database)
-						return createCategoryStructure(ctx, executor, concept)
-					})
+					tx, err := database.BeginTx(ctx, nil)
+					if err != nil {
+						fmt.Printf("Warning: failed to begin transaction for category: %v\n", err)
+						continue
+					}
+					err = createCategoryStructure(ctx, tx, concept)
+					if err != nil {
+						tx.Rollback()
+					} else {
+						tx.Commit()
+					}
 					if err != nil {
 						fmt.Printf("Warning: failed to create category structure for conceptId %v: %v\n", conceptId, err)
 						// 카테고리 생성 실패는 경고만 하고 계속 진행
@@ -647,82 +659,100 @@ func processFile(database *sql.DB, filename string, isG bool) error {
 }
 
 func main() {
-	// 폴더 경로를 argument로 받기
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: go run main.go <type - 문제집(m), 기출(g)> <folder_path>")
-		fmt.Println("Example: go run main.go g data/_전체/수능모의고사")
+	// 플래그 정의
+	var (
+		dataType   = flag.String("type", "", "문제집 타입: m(문제집), g(기출)")
+		folderPath = flag.String("folder", "", "JSON 파일이 있는 폴더 경로")
+		dbHost     = flag.String("host", "localhost", "데이터베이스 호스트")
+		dbPort     = flag.String("port", "5432", "데이터베이스 포트")
+		dbName     = flag.String("db", "postgres", "데이터베이스 이름")
+		sslMode    = flag.String("sslmode", "disable", "SSL 모드")
+	)
+
+	dbUser := "app_user" // 항상 고정
+
+	flag.Parse()
+
+	// 필수 플래그 검사
+	if *dataType == "" || *folderPath == "" || *dbName == "" {
+		fmt.Println("Usage:")
+		flag.PrintDefaults()
+		fmt.Println("\nExample:")
+		fmt.Println("  go run main.go -type=g -folder=data/_전체/수능모의고사 -host=localhost -port=5432 -db=mydb")
+		fmt.Println("\nNote: DB password is automatically retrieved from AWS Secrets Manager")
 		os.Exit(1)
 	}
 
-	dataType := os.Args[1]
-	folderPath := os.Args[2]
+	if *dataType != "m" && *dataType != "g" {
+		fmt.Println("Error: type must be 'm' (문제집) or 'g' (기출)")
+		os.Exit(1)
+	}
 
 	// 폴더가 존재하는지 확인
-	fileInfo, err := os.Stat(folderPath)
+	fileInfo, err := os.Stat(*folderPath)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 	if !fileInfo.IsDir() {
-		fmt.Printf("Error: %s is not a directory\n", folderPath)
+		fmt.Printf("Error: %s is not a directory\n", *folderPath)
 		os.Exit(1)
 	}
 
-	database := db.GetSQLDB()
+	// AWS Secrets Manager에서 DB 패스워드 가져오기
+	fmt.Println("Retrieving DB password from AWS Secrets Manager...")
+	dbPassword, err := getDBPasswordFromSecretsManager()
+	if err != nil {
+		fmt.Printf("Error retrieving DB password: %v\n", err)
+		os.Exit(1)
+	}
+
+	// PostgreSQL 데이터베이스 연결 문자열 생성
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		dbUser, dbPassword, *dbHost, *dbPort, *dbName, *sslMode)
+
+	fmt.Printf("Connecting to database: postgres://%s:***@%s:%s/%s?sslmode=%s\n",
+		dbUser, *dbHost, *dbPort, *dbName, *sslMode)
+
+	database, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Printf("Error connecting to database: %v\n", err)
+		os.Exit(1)
+	}
 	defer func() {
 		_ = database.Close()
 	}()
 
-	isG := dataType == "g"
+	isG := *dataType == "g"
 
 	// 폴더 내 모든 JSON 파일 처리
-	processFolder(database, folderPath, isG)
+	processFolder(database, *folderPath, isG)
 }
 
-func getOrCreateCategory(executor qrm.DB, parentID *int64, title string, sequence int64, metadata map[string]any) (*model.Categories, error) {
-	var category model.Categories
+func getOrCreateCategory(ctx context.Context, tx *sql.Tx, parentID *int64, title string, sequence int64, metadata map[string]any) (*struct{ ID int64 }, error) {
+	var category struct{ ID int64 }
 	var err error
+
 	if parentID == nil {
-		err = postgres.SELECT(
-			table.Categories.AllColumns,
-		).FROM(
-			table.Categories,
-		).WHERE(
-			table.Categories.ParentID.IS_NULL().AND(
-				table.Categories.Title.EQ(postgres.String(title))).AND(
-				table.Categories.DeletedAt.IS_NULL(),
-			),
-		).LIMIT(1).Query(executor, &category)
+		query := `SELECT id FROM categories WHERE parent_id IS NULL AND title = $1 AND deleted_at IS NULL LIMIT 1`
+		err = tx.QueryRowContext(ctx, query, title).Scan(&category.ID)
 	} else {
-		err = postgres.SELECT(
-			table.Categories.AllColumns,
-		).FROM(
-			table.Categories,
-		).WHERE(
-			table.Categories.ParentID.EQ(postgres.Int64(*parentID)).AND(
-				table.Categories.Title.EQ(postgres.String(title))),
-		).LIMIT(1).Query(executor, &category)
+		query := `SELECT id FROM categories WHERE parent_id = $1 AND title = $2 AND deleted_at IS NULL LIMIT 1`
+		err = tx.QueryRowContext(ctx, query, *parentID, title).Scan(&category.ID)
 	}
+
 	if err != nil {
-		if errors.Is(err, qrm.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
 			// metadata가 nil이면 빈 object로 설정
 			if metadata == nil {
 				metadata = map[string]any{}
 			}
 			metadataBytes, _ := json.Marshal(metadata)
-			metadataJSON := types.JSONB(metadataBytes)
 
-			err = table.Categories.INSERT(
-				table.Categories.Title,
-				table.Categories.ParentID,
-				table.Categories.Sequence,
-				table.Categories.Metadata,
-			).MODEL(model.Categories{
-				Title:    title,
-				ParentID: parentID,
-				Sequence: sequence,
-				Metadata: metadataJSON,
-			}).RETURNING(table.Categories.AllColumns).Query(executor, &category)
+			insertQuery := `INSERT INTO categories (title, parent_id, sequence, metadata, created_at, updated_at)
+						   VALUES ($1, $2, $3, $4, NOW(), NOW())
+						   RETURNING id`
+			err = tx.QueryRowContext(ctx, insertQuery, title, parentID, sequence, metadataBytes).Scan(&category.ID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create category: %w", err)
 			}
@@ -732,4 +762,41 @@ func getOrCreateCategory(executor qrm.DB, parentID *int64, title string, sequenc
 	}
 
 	return &category, nil
+}
+
+// AWS Secrets Manager에서 DB 패스워드 가져오기
+func getDBPasswordFromSecretsManager() (string, error) {
+	// AWS 세션 생성 (서울 리전)
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("ap-northeast-2"),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create AWS session: %w", err)
+	}
+
+	// Secrets Manager 클라이언트 생성
+	svc := secretsmanager.New(sess)
+
+	// 시크릿 값 가져오기
+	secretName := "base-inbrain/production/DB_PASSWORD"
+	result, err := svc.GetSecretValue(&secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret value: %w", err)
+	}
+
+	// JSON 파싱
+	var secretData map[string]string
+	err = json.Unmarshal([]byte(*result.SecretString), &secretData)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse secret JSON: %w", err)
+	}
+
+	password, exists := secretData["password"]
+	if !exists {
+		return "", fmt.Errorf("password field not found in secret")
+	}
+
+	return password, nil
 }
