@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -43,6 +44,7 @@ type Parser struct {
 	bucketName        string
 	region            string
 	forceReplaceVideo bool
+	testExam          bool
 }
 
 type SessionInfo struct {
@@ -77,6 +79,7 @@ func main() {
 	var s3Bucket string
 	var s3Region string
 	var forceReplaceVideo bool
+	var testExam bool
 
 	flag.StringVar(&sessionName, "session", "", "세션 이름 (예: '공통수학2 Day1')")
 	flag.StringVar(&s3Prefix, "s3-prefix", "", "S3 폴더명 (예: '공통수학2 Day1')")
@@ -89,6 +92,7 @@ func main() {
 	flag.StringVar(&s3Bucket, "s3-bucket", "base-inbrain-resource", "S3 버킷 이름")
 	flag.StringVar(&s3Region, "s3-region", "ap-northeast-2", "S3 리전")
 	flag.BoolVar(&forceReplaceVideo, "force-replace-video", false, "기존 비디오를 강제로 대체")
+	flag.BoolVar(&testExam, "test-exam", false, "연습 문제에 비디오 매핑하지 않음")
 	flag.Parse()
 
 	// 세션명이 비어있으면 s3Prefix를 그대로 사용
@@ -111,11 +115,12 @@ func main() {
 		fmt.Println("  -s3-bucket='버킷명' (기본값: base-inbrain-resource)")
 		fmt.Println("  -s3-region='리전' (기본값: ap-northeast-2)")
 		fmt.Println("  -force-replace-video (기존 비디오 강제 대체)")
+		fmt.Println("  -test-exam (연습 문제에 비디오 매핑하지 않음)")
 		os.Exit(1)
 	}
 
 	// Parser 초기화
-	parser, err := NewParser(dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode, s3Bucket, s3Region, forceReplaceVideo)
+	parser, err := NewParser(dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode, s3Bucket, s3Region, forceReplaceVideo, testExam)
 	if err != nil {
 		log.Fatal("Parser 초기화 실패:", err)
 	}
@@ -135,7 +140,7 @@ func main() {
 	log.Println("✅ S3 콘텐츠 파싱 완료!")
 }
 
-func NewParser(dbHost string, dbPort int, dbUser, dbPassword, dbName, dbSSLMode, bucketName, region string, forceReplaceVideo bool) (*Parser, error) {
+func NewParser(dbHost string, dbPort int, dbUser, dbPassword, dbName, dbSSLMode, bucketName, region string, forceReplaceVideo bool, testExam bool) (*Parser, error) {
 	// 데이터베이스 연결
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		dbHost, dbPort, dbUser, dbPassword, dbName, dbSSLMode)
@@ -159,6 +164,7 @@ func NewParser(dbHost string, dbPort int, dbUser, dbPassword, dbName, dbSSLMode,
 		bucketName:        bucketName,
 		region:            region,
 		forceReplaceVideo: forceReplaceVideo,
+		testExam:          testExam,
 	}, nil
 }
 
@@ -519,22 +525,31 @@ func (p *Parser) createSectionWithIndex(name string, moduleID int64, index int) 
 
 // video 생성 함수 - parse_excel과 동일한 로직
 func (p *Parser) createVideoFromURL(title, videoURL, s3Path string) (int64, error) {
-	// URL에서 MD5 해시 계산
-	md5Hash, err := calculateURLMD5(videoURL)
-	if err != nil {
-		return 0, fmt.Errorf("MD5 계산 실패 -> %w", err)
-	}
+	// testExam 모드가 아닐 때만 MD5 체크
+	var md5Hash string
+	var err error
+	if !p.testExam {
+		// URL에서 MD5 해시 계산
+		md5Hash, err = calculateURLMD5(videoURL)
+		if err != nil {
+			return 0, fmt.Errorf("MD5 계산 실패 -> %w", err)
+		}
 
-	// MD5 해시로 이미 존재하는 비디오 확인
-	var existingID int64
-	var existingUUID string
-	checkQuery := `SELECT id, uuid FROM videos WHERE md5_hash = $1 AND deleted_at IS NULL`
-	err = p.db.QueryRow(checkQuery, md5Hash).Scan(&existingID, &existingUUID)
+		// MD5 해시로 이미 존재하는 비디오 확인
+		var existingID int64
+		var existingUUID string
+		checkQuery := `SELECT id, uuid FROM videos WHERE md5_hash = $1 AND deleted_at IS NULL`
+		err = p.db.QueryRow(checkQuery, md5Hash).Scan(&existingID, &existingUUID)
 
-	// 이미 존재하는 경우 처리
-	if err == nil {
-		log.Printf("동일한 비디오 이미 존재 (MD5: %s): ID %d, UUID %s", md5Hash, existingID, existingUUID)
-		return existingID, nil
+		// 이미 존재하는 경우 처리
+		if err == nil {
+			log.Printf("동일한 비디오 이미 존재 (MD5: %s): ID %d, UUID %s", md5Hash, existingID, existingUUID)
+			return existingID, nil
+		}
+	} else {
+		// testExam 모드에서는 항상 새 비디오 생성 (MD5 체크 없이)
+		log.Printf("테스트 모드: MD5 체크 없이 새 비디오 생성")
+		md5Hash = "" // 빈 MD5 해시
 	}
 
 	// 새로운 UUID 생성
@@ -702,7 +717,7 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 
 			if err == nil {
 				// 기존 콘텐츠가 있음
-				if p.forceReplaceVideo {
+				if p.forceReplaceVideo && !p.testExam {
 					// force-replace-video 옵션: 기존 콘텐츠의 해설 비디오 교체
 					log.Printf("기존 연습 콘텐츠의 해설 비디오 교체: content_id %d, exercise_id %d", existingContentID, exerciseID)
 
@@ -731,18 +746,22 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 			}
 
 			// 새로운 콘텐츠 생성 (기존 콘텐츠가 없을 때)
-			// video 생성
-			videoID, err := p.createVideoFromURL(title, videoURL, s3Path)
-			if err != nil {
-				log.Printf("해설 비디오 생성 실패: %v", err)
-				continue
-			}
+			if !p.testExam {
+				// video 생성
+				videoID, err := p.createVideoFromURL(title, videoURL, s3Path)
+				if err != nil {
+					log.Printf("해설 비디오 생성 실패: %v", err)
+					continue
+				}
 
-			// exercise 업데이트
-			err = p.updateExerciseSolutionWithVideoID(exerciseID, videoID)
-			if err != nil {
-				log.Printf("해설 영상 업데이트 실패: %v", err)
-				continue
+				// exercise 업데이트
+				err = p.updateExerciseSolutionWithVideoID(exerciseID, videoID)
+				if err != nil {
+					log.Printf("해설 영상 업데이트 실패: %v", err)
+					continue
+				}
+			} else {
+				log.Printf("테스트 모드: 해설 비디오 생성 스킵 (exercise_id: %d)", exerciseID)
 			}
 
 			_ = p.createExerciseContent(exerciseID, exerciseGroupID, sectionID, studentID, contentSequence, "example", exampleTitle)
@@ -1031,4 +1050,34 @@ func generateExerciseTitle(exerciseType string, exerciseNumber int) string {
 	default:
 		return fmt.Sprintf("문제%d", exerciseNumber)
 	}
+}
+
+func SafeOpenFile(filename string) (*os.File, error) {
+	// 상대 경로 공격 방지
+	if strings.Contains(filename, "..") {
+		return nil, errors.New("invalid file path: relative path not allowed")
+	}
+
+	// 절대 경로로 정리
+	cleanPath := filepath.Clean(filename)
+
+	return os.Open(cleanPath)
+}
+
+// ValidateTempPath 임시 파일 경로 검증 - /tmp 디렉토리만 허용
+func ValidateTempPath(filename string) (string, error) {
+	// 상대 경로 공격 방지
+	if strings.Contains(filename, "..") {
+		return "", errors.New("invalid file path: relative path not allowed")
+	}
+
+	// 절대 경로로 정리
+	cleanPath := filepath.Clean(filename)
+
+	// /tmp 디렉토리만 허용
+	if !strings.HasPrefix(cleanPath, "/tmp/") {
+		return "", errors.New("invalid temp file path: only /tmp directory allowed")
+	}
+
+	return cleanPath, nil
 }
