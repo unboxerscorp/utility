@@ -675,41 +675,42 @@ func processFile(database *sql.DB, filename string, isG bool) error {
 func main() {
 	// 플래그 정의
 	var (
-		dataType   = flag.String("type", "", "문제집 타입: m(문제집), g(기출)")
-		folderPath = flag.String("folder", "", "JSON 파일이 있는 폴더 경로")
-		dbHost     = flag.String("host", "localhost", "데이터베이스 호스트")
-		dbPort     = flag.String("port", "5432", "데이터베이스 포트")
-		dbName     = flag.String("db", "postgres", "데이터베이스 이름")
-		sslMode    = flag.String("sslmode", "disable", "SSL 모드")
+		dataType = flag.String("type", "", "문제집 타입: m(문제집), g(기출), d(카테고리 정의)")
+		dbHost   = flag.String("host", "localhost", "데이터베이스 호스트")
+		dbPort   = flag.String("port", "5432", "데이터베이스 포트")
+		dbName   = flag.String("db", "postgres", "데이터베이스 이름")
+		sslMode  = flag.String("sslmode", "disable", "SSL 모드")
 	)
 
 	dbUser := "app_user" // 항상 고정
 
 	flag.Parse()
 
-	// 필수 플래그 검사
-	if *dataType == "" || *folderPath == "" || *dbName == "" {
+	// 필수 인자 검사
+	if *dataType == "" || *dbName == "" || len(flag.Args()) == 0 {
 		fmt.Println("Usage:")
 		flag.PrintDefaults()
+		fmt.Println("\nArguments:")
+		fmt.Println("  <path>  폴더 경로 또는 JSON 파일 경로")
 		fmt.Println("\nExample:")
-		fmt.Println("  go run main.go -type=g -folder=data/_전체/수능모의고사 -host=localhost -port=5432 -db=mydb")
+		fmt.Println("  go run main.go -type=g data/_전체/수능모의고사 -host=localhost -port=5432 -db=mydb")
+		fmt.Println("  go run main.go -type=d a.json -host=localhost -port=5432 -db=mydb")
 		fmt.Println("\nNote: DB password is automatically retrieved from AWS Secrets Manager")
 		os.Exit(1)
 	}
 
-	if *dataType != "m" && *dataType != "g" {
-		fmt.Println("Error: type must be 'm' (문제집) or 'g' (기출)")
+	if *dataType != "m" && *dataType != "g" && *dataType != "d" {
+		fmt.Println("Error: type must be 'm' (문제집), 'g' (기출), or 'd' (카테고리 정의)")
 		os.Exit(1)
 	}
 
-	// 폴더가 존재하는지 확인
-	fileInfo, err := os.Stat(*folderPath)
+	// 첫 번째 인자를 경로로 사용
+	targetPath := flag.Args()[0]
+
+	// 경로 존재 확인
+	fileInfo, err := os.Stat(targetPath)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
-	if !fileInfo.IsDir() {
-		fmt.Printf("Error: %s is not a directory\n", *folderPath)
 		os.Exit(1)
 	}
 
@@ -738,10 +739,40 @@ func main() {
 		_ = database.Close()
 	}()
 
-	isG := *dataType == "g"
-
-	// 폴더 내 모든 JSON 파일 처리
-	processFolder(database, *folderPath, isG)
+	// 경로가 디렉토리인지 파일인지에 따라 처리
+	if fileInfo.IsDir() {
+		// 디렉토리 처리
+		switch *dataType {
+		case "d":
+			fmt.Println("Error: directory is not supported for type 'd' (카테고리 정의)")
+			os.Exit(1)
+		case "m", "g":
+			// 문제집/기출 처리
+			isG := *dataType == "g"
+			processFolder(database, targetPath, isG)
+		}
+	} else {
+		// 단일 파일 처리
+		switch *dataType {
+		case "d":
+			// 카테고리 정의 처리
+			err = processCategoryDefinition(database, targetPath)
+			if err != nil {
+				fmt.Printf("Error processing category definition: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Category definition processing completed successfully")
+		case "m", "g":
+			// 단일 JSON 파일 처리
+			isG := *dataType == "g"
+			err = processFile(database, targetPath, isG)
+			if err != nil {
+				fmt.Printf("Error processing file: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Successfully processed: %s\n", filepath.Base(targetPath))
+		}
+	}
 }
 
 func getOrCreateCategory(ctx context.Context, tx *sql.Tx, parentID *int64, title string, sequence int64, metadata map[string]any) (*struct{ ID int64 }, error) {
@@ -812,4 +843,171 @@ func getDBPasswordFromSecretsManager(ctx context.Context) (string, error) {
 	}
 
 	return password, nil
+}
+
+// 카테고리 정의 구조체
+type CategoryDefinition struct {
+	ID           int                  `json:"id"`
+	Revision     string               `json:"revision"`
+	SchoolType   string               `json:"schoolType"`
+	Grade        string               `json:"grade"`
+	Semester     int                  `json:"semester"`
+	ConceptIds   []int                `json:"conceptIds"`
+	BigChapters  []BigChapterDef      `json:"bigChapters"`
+}
+
+type BigChapterDef struct {
+	ID             int                `json:"id"`
+	Name           string             `json:"name"`
+	MiddleChapters []MiddleChapterDef `json:"middleChapters"`
+}
+
+type MiddleChapterDef struct {
+	ID             int               `json:"id"`
+	Name           string            `json:"name"`
+	LittleChapters []LittleChapterDef `json:"littleChapters"`
+}
+
+type LittleChapterDef struct {
+	ID       int          `json:"id"`
+	Name     string       `json:"name"`
+	Concepts []ConceptDef `json:"concepts"`
+}
+
+type ConceptDef struct {
+	ID            int    `json:"id"`
+	Name          string `json:"name"`
+	Priority      int    `json:"priority"`
+	TopicCount    int    `json:"topicCount"`
+	SubTopicCount int    `json:"subTopicCount"`
+}
+
+// 카테고리 정의를 기반으로 sequence 업데이트
+func processCategoryDefinition(database *sql.DB, filePath string) error {
+	// JSON 파일 읽기
+	jsonFile, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer func() {
+		_ = jsonFile.Close()
+	}()
+
+	data, err := io.ReadAll(jsonFile)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	var categoryDefs []CategoryDefinition
+	err = json.Unmarshal(data, &categoryDefs)
+	if err != nil {
+		return fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	ctx := context.Background()
+
+	for _, catDef := range categoryDefs {
+		fmt.Printf("Processing category definition for %s %s %s semester %d\n", 
+			catDef.Revision, catDef.SchoolType, catDef.Grade, catDef.Semester)
+		
+		// 각 카테고리 정의를 개별 트랜잭션으로 처리
+		tx, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			fmt.Printf("Warning: failed to begin transaction: %v\n", err)
+			continue
+		}
+
+		err = updateCategorySequences(ctx, tx, catDef)
+		if err != nil {
+			_ = tx.Rollback()
+			fmt.Printf("Warning: failed to update category sequences: %v\n", err)
+		} else {
+			_ = tx.Commit()
+			fmt.Printf("Successfully updated category sequences\n")
+		}
+	}
+
+	return nil
+}
+
+// 카테고리 sequence 업데이트
+func updateCategorySequences(ctx context.Context, tx *sql.Tx, catDef CategoryDefinition) error {
+	// 1. 대단원 sequence 업데이트
+	for bigSeq, bigChapter := range catDef.BigChapters {
+		err := updateCategorySequence(ctx, tx, bigChapter.Name, int64(bigSeq), map[string]any{
+			"mathflatBigChapterId": bigChapter.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update big chapter sequence: %w", err)
+		}
+
+		// 2. 중단원 sequence 업데이트
+		for middleSeq, middleChapter := range bigChapter.MiddleChapters {
+			err := updateCategorySequence(ctx, tx, middleChapter.Name, int64(middleSeq), map[string]any{
+				"mathflatMiddleChapterId": middleChapter.ID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to update middle chapter sequence: %w", err)
+			}
+
+			// 3. 소단원 sequence 업데이트
+			for littleSeq, littleChapter := range middleChapter.LittleChapters {
+				err := updateCategorySequence(ctx, tx, littleChapter.Name, int64(littleSeq), map[string]any{
+					"mathflatLittleChapterId": littleChapter.ID,
+				})
+				if err != nil {
+					return fmt.Errorf("failed to update little chapter sequence: %w", err)
+				}
+
+				// 4. 개념 sequence 업데이트
+				for conceptSeq, concept := range littleChapter.Concepts {
+					err := updateCategorySequence(ctx, tx, concept.Name, int64(conceptSeq), map[string]any{
+						"mathflatConceptId": concept.ID,
+					})
+					if err != nil {
+						return fmt.Errorf("failed to update concept sequence: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// 특정 카테고리의 sequence 업데이트
+func updateCategorySequence(ctx context.Context, tx *sql.Tx, title string, sequence int64, metadata map[string]any) error {
+	// metadata로 카테고리 찾기
+	var categoryID int64
+	var found bool
+
+	for key, value := range metadata {
+		query := `SELECT id FROM categories WHERE "metadata"->$1 = $2 AND deleted_at IS NULL`
+		valueStr := fmt.Sprintf("%v", value)
+		
+		err := tx.QueryRowContext(ctx, query, key, valueStr).Scan(&categoryID)
+		if err == nil {
+			found = true
+			break
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to query category: %w", err)
+		}
+	}
+
+	if !found {
+		// 카테고리가 없으면 스킵 (경고만 출력)
+		fmt.Printf("Warning: category not found for title '%s', skipping sequence update\n", title)
+		return nil
+	}
+
+	// sequence 업데이트
+	updateQuery := `UPDATE categories SET "sequence" = $1, updated_at = NOW() WHERE id = $2`
+	_, err := tx.ExecContext(ctx, updateQuery, sequence, categoryID)
+	if err != nil {
+		return fmt.Errorf("failed to update category sequence: %w", err)
+	}
+
+	fmt.Printf("Updated sequence for category '%s' to %d\n", title, sequence)
+	return nil
 }
