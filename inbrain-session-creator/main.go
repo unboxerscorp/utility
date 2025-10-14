@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
@@ -605,32 +606,32 @@ func (p *Parser) createLectureWithVideoID(title string, videoID int64) (int64, e
 	return id, err
 }
 
-func (p *Parser) updateExerciseSolutionWithVideoID(exerciseID int, videoID int64) error {
+func (p *Parser) updateExerciseSolutionWithVideoID(exerciseRefID string, videoID int64) error {
 	// force 옵션이 없을 때만 기존 비디오 체크
 	if !p.forceReplaceVideo {
 		// 먼저 해당 exercise의 solution_video_id가 이미 설정되어 있는지 확인
 		var existingVideoID sql.NullInt64
-		checkQuery := `SELECT solution_video_id FROM exercises WHERE id = $1`
-		err := p.db.QueryRow(checkQuery, exerciseID).Scan(&existingVideoID)
+		checkQuery := `SELECT solution_video_id FROM exercises WHERE ref_id = $1`
+		err := p.db.QueryRow(checkQuery, exerciseRefID).Scan(&existingVideoID)
 
 		// 레코드가 없는 경우
 		if errors.Is(err, sql.ErrNoRows) {
-			log.Printf("exercise_id %d를 찾을 수 없습니다", exerciseID)
-			return fmt.Errorf("exercise not found: %d", exerciseID)
+			log.Printf("exercise_ref_id %s를 찾을 수 없습니다", exerciseRefID)
+			return fmt.Errorf("exercise not found: %s", exerciseRefID)
 		}
 
 		// 이미 비디오가 설정되어 있는 경우
 		if existingVideoID.Valid && existingVideoID.Int64 > 0 {
-			log.Printf("해설 영상 이미 존재: exercise_id %d (video_id: %d)", exerciseID, existingVideoID.Int64)
+			log.Printf("해설 영상 이미 존재: exercise_ref_id %s (video_id: %d)", exerciseRefID, existingVideoID.Int64)
 			return nil
 		}
 	}
 
-	log.Printf("해설 영상 처리: exercise_id %d", exerciseID)
+	log.Printf("해설 영상 처리: exercise_ref_id %s", exerciseRefID)
 
 	// exercises 테이블 업데이트
-	query := `UPDATE exercises SET solution_video_id = $1 WHERE id = $2`
-	_, err := p.db.Exec(query, videoID, exerciseID)
+	query := `UPDATE exercises SET solution_video_id = $1 WHERE ref_id = $2`
+	_, err := p.db.Exec(query, videoID, exerciseRefID)
 
 	return err
 }
@@ -700,8 +701,8 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 
 		if isSolutionFile(filename) {
 			// 해설 영상 처리
-			exerciseGroupID := extractExerciseGroupID(filename)
-			exerciseID := extractExerciseID(filename)
+			// exerciseGroupID := extractExerciseGroupID(filename)
+			exerciseRefID := extractExerciseRefID(filename)
 			title := fmt.Sprintf("해설 영상 - %s", extractTitle(filename))
 			var exampleTitle string
 			if moduleType == "exam" {
@@ -719,7 +720,7 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 				// 기존 콘텐츠가 있음
 				if p.forceReplaceVideo && !p.testExam {
 					// force-replace-video 옵션: 기존 콘텐츠의 해설 비디오 교체
-					log.Printf("기존 연습 콘텐츠의 해설 비디오 교체: content_id %d, exercise_id %d", existingContentID, exerciseID)
+					log.Printf("기존 연습 콘텐츠의 해설 비디오 교체: content_id %d, exercise_ref_id %s", existingContentID, exerciseRefID)
 
 					// 새 비디오 생성
 					var videoID int64
@@ -730,13 +731,13 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 					}
 
 					// exercise의 solution_video_id 업데이트
-					err = p.updateExerciseSolutionWithVideoID(exerciseID, videoID)
+					err = p.updateExerciseSolutionWithVideoID(exerciseRefID, videoID)
 					if err != nil {
 						log.Printf("해설 영상 업데이트 실패: %v", err)
 						continue
 					}
 
-					log.Printf("해설 비디오 교체 완료: exercise_id %d, new_video_id %d", exerciseID, videoID)
+					log.Printf("해설 비디오 교체 완료: exercise_ref_id %s, new_video_id %d", exerciseRefID, videoID)
 				} else {
 					// 일반 모드에서는 기존 콘텐츠가 있으면 스킵
 					log.Printf("기존 연습 콘텐츠 존재 (sequence: %d), 스킵", contentSequence)
@@ -755,16 +756,16 @@ func (p *Parser) processSectionContents(s3Prefix, moduleName, sectionName string
 				}
 
 				// exercise 업데이트
-				err = p.updateExerciseSolutionWithVideoID(exerciseID, videoID)
+				err = p.updateExerciseSolutionWithVideoID(exerciseRefID, videoID)
 				if err != nil {
 					log.Printf("해설 영상 업데이트 실패: %v", err)
 					continue
 				}
 			} else {
-				log.Printf("테스트 모드: 해설 비디오 생성 스킵 (exercise_id: %d)", exerciseID)
+				log.Printf("테스트 모드: 해설 비디오 생성 스킵 (exercise_ref_id: %s)", exerciseRefID)
 			}
 
-			_ = p.createExerciseContent(exerciseID, exerciseGroupID, sectionID, studentID, contentSequence, "example", exampleTitle)
+			_ = p.createExerciseContent(exerciseRefID, sectionID, studentID, contentSequence, "example", exampleTitle)
 			exerciseCounter++
 		} else {
 			// 강의 영상 처리
@@ -844,13 +845,24 @@ func (p *Parser) createLectureContent(lectureID, sectionID int64, studentID, seq
 	return err
 }
 
-func (p *Parser) createExerciseContent(exerciseID, exerciseGroupID int, sectionID int64, studentID, sequence int, exerciseType, title string) error {
+func (p *Parser) createExerciseContent(exerciseRefID string, sectionID int64, studentID, sequence int, exerciseType, title string) error {
 	// 새로운 연습 콘텐츠 생성 (중복 체크는 호출하는 곳에서 이미 함)
 	query := `
-		INSERT INTO learning_contents (title, content_type, lecture_id, exercise_id, required_exercise_group_id, exercise_type, sequence, section_id, user_id)
-		VALUES ($1, 'exercise', NULL, $2, $3, $4, $5, $6, $7)`
+		SELECT id FROM exercises WHERE ref_id = $1
+		LIMIT 1
+	`
 
-	_, err := p.db.Exec(query, title, exerciseID, exerciseGroupID, exerciseType, sequence, sectionID, studentID)
+	var exerciseID int64
+	err := p.db.QueryRow(query, exerciseRefID).Scan(&exerciseID)
+	if err != nil {
+		return err
+	}
+
+	query = `
+		INSERT INTO learning_contents (title, content_type, lecture_id, exercise_id, required_exercise_group_id, exercise_type, sequence, section_id, user_id)
+		VALUES ($1, 'exercise', NULL, $2, NULL, $3, $4, $5, $6)`
+
+	_, err = p.db.Exec(query, title, exerciseID, exerciseType, sequence, sectionID, studentID)
 	if err == nil {
 		log.Printf("새 연습 콘텐츠 생성: title %s (sequence: %d)", title, sequence)
 	}
@@ -1004,29 +1016,28 @@ func isSolutionFile(filename string) bool {
 	return strings.Contains(filename, "해설")
 }
 
-func extractExerciseID(filename string) int {
+func extractExerciseRefID(filename string) string {
 	// 파일명_1234.mov -> 1234
-	re := regexp.MustCompile(`_(\d+)\.(mov|mp4)$`)
+	re := regexp.MustCompile(`해설_([a-zA-Z0-9]+)\.(mov|mp4)$`)
 	matches := re.FindStringSubmatch(filename)
 	if len(matches) > 1 {
-		id, _ := strconv.Atoi(matches[1])
-		return id
+		return matches[1]
 	}
-	return 0
+	return ""
 }
 
-func extractExerciseGroupID(filename string) int {
-	// 해설_1201_2399.mov -> 1201
-	if strings.Contains(filename, "해설") {
-		re := regexp.MustCompile(`해설_(\d+)_\d+\.(mov|mp4)$`)
-		matches := re.FindStringSubmatch(filename)
-		if len(matches) > 1 {
-			id, _ := strconv.Atoi(matches[1])
-			return id
-		}
-	}
-	return 0
-}
+// func extractExerciseGroupID(filename string) int {
+// 	// 해설_1201_2399.mov -> 1201
+// 	if strings.Contains(filename, "해설") {
+// 		re := regexp.MustCompile(`해설_(\d+)_\d+\.(mov|mp4)$`)
+// 		matches := re.FindStringSubmatch(filename)
+// 		if len(matches) > 1 {
+// 			id, _ := strconv.Atoi(matches[1])
+// 			return id
+// 		}
+// 	}
+// 	return 0
+// }
 
 func generateLectureTitle(moduleType string, lectureCount, lectureIndex int) string {
 	baseTitle := "강의"
